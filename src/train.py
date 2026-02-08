@@ -189,8 +189,12 @@ def train_one_epoch(
     for batch_idx, batch in enumerate(dataloader):
         last_batch_idx = batch_idx
         step += 1
+        has_padding = bool(batch.get("has_padding", True))
         input_ids = batch["input_ids"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
+        if not has_padding:
+            attention_mask = None
+        else:
+            attention_mask = batch["attention_mask"].to(device)
         example_ids = batch["example_ids"].to(device)
         positions_3d = batch["positions_3d"].to(device)
         if accum_index == 0:
@@ -293,8 +297,12 @@ def validate_one_epoch(
     total_tokens = 0
 
     for batch in dataloader:
+        has_padding = bool(batch.get("has_padding", True))
         input_ids = batch["input_ids"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
+        if not has_padding:
+            attention_mask = None
+        else:
+            attention_mask = batch["attention_mask"].to(device)
         example_ids = batch["example_ids"].to(device)
         positions_3d = batch["positions_3d"].to(device)
 

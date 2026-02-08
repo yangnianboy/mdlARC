@@ -694,6 +694,7 @@ def collate_examples(
 
     batch_size = len(selected)
     max_len = max(item[3] for item in selected)
+    has_padding = any(item[3] != max_len for item in selected)
 
     input_ids = torch.full((batch_size, max_len), pad_token_id, dtype=torch.long)
     attention_mask = torch.zeros((batch_size, max_len), dtype=torch.bool)
@@ -717,6 +718,7 @@ def collate_examples(
     return {
         "input_ids": input_ids,
         "attention_mask": attention_mask,
+        "has_padding": has_padding,
         "example_ids": example_ids,
         "positions_3d": positions_3d,
         "task_ids": [example.task_id for example in batch],

@@ -66,6 +66,7 @@ class MultiHeadSelfAttention(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         causal_mask: Optional[torch.Tensor] = None,
         pos_xyz: Optional[torch.Tensor] = None,
+        sdpa_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         batch_size, seq_len, dim = hidden_states.shape
 
@@ -78,34 +79,37 @@ class MultiHeadSelfAttention(nn.Module):
             # pos_xyz: [B, S, 3] (x, y, z)
             queries, keys = self.rope.apply_rotary(queries, keys, pos_xyz)
 
-        # Construct a combined attention bias for SDPA
-        # SDPA handles broadcasting, but constructing the mask explicitly ensures
-        # correctness with your specific causal + padding setup.
-        attn_bias = None
+        # Reuse a precomputed mask when provided by the model forward path.
+        attn_bias = sdpa_mask
+        if attn_bias is None:
+            # Construct a combined attention bias for SDPA
+            # SDPA handles broadcasting, but constructing the mask explicitly ensures
+            # correctness with your specific causal + padding setup.
+            attn_bias = None
 
-        # 1. Start with Causal Mask if present
-        if causal_mask is not None:
-            # causal_mask is usually boolean [1, 1, S, S] where True means "Mask out"
-            # We convert to float: 0.0 for keep, -inf for mask
-            attn_bias = torch.zeros(
-                (1, 1, seq_len, seq_len), device=queries.device, dtype=queries.dtype
-            )
-            attn_bias = attn_bias.masked_fill(causal_mask, float("-inf"))
-
-        # 2. Apply Padding Mask (attention_mask)
-        if attention_mask is not None:
-            # attention_mask is [B, S] where True means "Keep", False means "Pad"
-            # We need to mask out keys where attention_mask is False.
-            if attn_bias is None:
+            # 1. Start with Causal Mask if present
+            if causal_mask is not None:
+                # causal_mask is usually boolean [1, 1, S, S] where True means "Mask out"
+                # We convert to float: 0.0 for keep, -inf for mask
                 attn_bias = torch.zeros(
-                    (batch_size, 1, seq_len, seq_len),
-                    device=queries.device,
-                    dtype=queries.dtype,
+                    (1, 1, seq_len, seq_len), device=queries.device, dtype=queries.dtype
                 )
+                attn_bias = attn_bias.masked_fill(causal_mask, float("-inf"))
 
-            # Broadcast attention_mask to [B, 1, 1, S]
-            key_mask = ~attention_mask[:, None, None, :]
-            attn_bias = attn_bias.masked_fill(key_mask, float("-inf"))
+            # 2. Apply Padding Mask (attention_mask)
+            if attention_mask is not None:
+                # attention_mask is [B, S] where True means "Keep", False means "Pad"
+                # We need to mask out keys where attention_mask is False.
+                if attn_bias is None:
+                    attn_bias = torch.zeros(
+                        (batch_size, 1, seq_len, seq_len),
+                        device=queries.device,
+                        dtype=queries.dtype,
+                    )
+
+                # Broadcast attention_mask to [B, 1, 1, S]
+                key_mask = ~attention_mask[:, None, None, :]
+                attn_bias = attn_bias.masked_fill(key_mask, float("-inf"))
 
         # Fused Flash Attention execution
         # Note: We pass is_causal=False because we manually constructed the causal mask into attn_bias above
@@ -248,16 +252,14 @@ class TransformerBlock(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor],
-        causal_mask: torch.Tensor,
+        sdpa_mask: Optional[torch.Tensor],
         pos_xyz: Optional[torch.Tensor],
     ) -> torch.Tensor:
         attn_input = self.ln_1(hidden_states)
         attn_output = self.attention(
             attn_input,
-            attention_mask=attention_mask,
-            causal_mask=causal_mask,
             pos_xyz=pos_xyz,
+            sdpa_mask=sdpa_mask,
         )
         hidden_states = hidden_states + attn_output
 
@@ -402,9 +404,15 @@ class TinyTransformer(nn.Module):
             pos_xyz = positions_3d.to(device=device, dtype=torch.long)
 
         causal_mask = self._build_causal_mask(seq_len, device)
+        sdpa_mask = torch.zeros(
+            (1, 1, seq_len, seq_len), device=device, dtype=hidden_states.dtype
+        )
+        sdpa_mask = sdpa_mask.masked_fill(causal_mask, float("-inf"))
+        key_mask = ~attention_mask[:, None, None, :]
+        sdpa_mask = sdpa_mask.masked_fill(key_mask, float("-inf"))
 
         for block in self.blocks:
-            hidden_states = block(hidden_states, attention_mask, causal_mask, pos_xyz)
+            hidden_states = block(hidden_states, sdpa_mask, pos_xyz)
             hidden_states = hidden_states * attention_mask.unsqueeze(-1)
 
         hidden_states = self.norm(hidden_states)
