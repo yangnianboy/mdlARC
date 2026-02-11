@@ -443,16 +443,31 @@ def train_one_epoch(
     for batch_idx, batch in enumerate(dataloader):
         last_batch_idx = batch_idx
         step += 1
-        has_padding = bool(batch.get("has_padding", True))
         input_ids = batch["input_ids"].to(device)
         sep_indices_cpu = batch.get("sep_indices")
         sep_indices = (
             sep_indices_cpu.to(device) if sep_indices_cpu is not None else None
         )
-        if not has_padding:
+        cu_seqlens_cpu = batch.get("cu_seqlens")
+        if cu_seqlens_cpu is not None:
+            cu_seqlens = cu_seqlens_cpu.to(device=device, dtype=torch.int32)
+            max_seqlen_raw = batch.get("max_seqlen")
+            if max_seqlen_raw is None:
+                raise ValueError("Packed batches must include max_seqlen.")
+            max_seqlen = (
+                int(max_seqlen_raw.item())
+                if torch.is_tensor(max_seqlen_raw)
+                else int(max_seqlen_raw)
+            )
             attention_mask = None
         else:
-            attention_mask = batch["attention_mask"].to(device)
+            cu_seqlens = None
+            max_seqlen = None
+            has_padding = bool(batch.get("has_padding", True))
+            if not has_padding:
+                attention_mask = None
+            else:
+                attention_mask = batch["attention_mask"].to(device)
         example_ids = batch["example_ids"].to(device)
         positions_3d = batch["positions_3d"].to(device)
         if accum_index == 0:
@@ -473,6 +488,8 @@ def train_one_epoch(
                 sep_indices=sep_indices,
                 compute_input_loss=False,
                 positions_3d=positions_3d,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
             )
             loss = outputs["output_loss"]
             inp_loss = outputs.get("input_loss")
@@ -561,34 +578,55 @@ def validate_one_epoch(
 ) -> float:
     """Calculates validation loss (Output Loss) on the test set."""
     model.eval()
+    use_amp = device.type == "cuda"
     total_loss_sum = torch.zeros((), device=device, dtype=torch.float32)
     total_tokens = torch.zeros((), device=device, dtype=torch.float32)
 
     for batch in dataloader:
-        has_padding = bool(batch.get("has_padding", True))
         input_ids = batch["input_ids"].to(device)
         sep_indices_cpu = batch.get("sep_indices")
         sep_indices = (
             sep_indices_cpu.to(device) if sep_indices_cpu is not None else None
         )
-        if not has_padding:
+        cu_seqlens_cpu = batch.get("cu_seqlens")
+        if cu_seqlens_cpu is not None:
+            cu_seqlens = cu_seqlens_cpu.to(device=device, dtype=torch.int32)
+            max_seqlen_raw = batch.get("max_seqlen")
+            if max_seqlen_raw is None:
+                raise ValueError("Packed batches must include max_seqlen.")
+            max_seqlen = (
+                int(max_seqlen_raw.item())
+                if torch.is_tensor(max_seqlen_raw)
+                else int(max_seqlen_raw)
+            )
             attention_mask = None
         else:
-            attention_mask = batch["attention_mask"].to(device)
+            cu_seqlens = None
+            max_seqlen = None
+            has_padding = bool(batch.get("has_padding", True))
+            if not has_padding:
+                attention_mask = None
+            else:
+                attention_mask = batch["attention_mask"].to(device)
         example_ids = batch["example_ids"].to(device)
         positions_3d = batch["positions_3d"].to(device)
 
         if not any(batch["has_output"]):
             continue
 
-        outputs = model(
-            input_ids,
-            example_ids,
-            attention_mask=attention_mask,
-            sep_indices=sep_indices,
-            compute_input_loss=False,
-            positions_3d=positions_3d,
-        )
+        with torch.autocast(
+            device_type=device.type, dtype=torch.bfloat16, enabled=use_amp
+        ):
+            outputs = model(
+                input_ids,
+                example_ids,
+                attention_mask=attention_mask,
+                sep_indices=sep_indices,
+                compute_input_loss=False,
+                positions_3d=positions_3d,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+            )
 
         out_loss = outputs.get("output_loss")
         num_tokens = outputs.get("num_output_tokens")

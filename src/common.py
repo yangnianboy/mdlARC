@@ -673,6 +673,7 @@ def collate_examples(
 ) -> Dict[str, torch.Tensor]:
     if not batch:
         raise ValueError("Empty batch encountered during collation.")
+    del pad_token_id
 
     selected: List[
         Tuple[
@@ -710,34 +711,40 @@ def collate_examples(
         selected.append((example, tokens, cached_positions, seq_len, sep_index, mapping))
 
     batch_size = len(selected)
-    max_len = max(item[3] for item in selected)
-    has_padding = any(item[3] != max_len for item in selected)
+    seq_lengths = torch.tensor([item[3] for item in selected], dtype=torch.int32)
+    max_len = int(seq_lengths.max().item())
+    total_tokens = int(seq_lengths.sum().item())
 
-    input_ids = torch.full((batch_size, max_len), pad_token_id, dtype=torch.long)
-    attention_mask = torch.zeros((batch_size, max_len), dtype=torch.bool)
+    input_ids = torch.zeros(total_tokens, dtype=torch.long)
     example_ids = torch.zeros(batch_size, dtype=torch.long)
     sep_indices = torch.zeros(batch_size, dtype=torch.long)
-    positions_3d = torch.zeros((batch_size, max_len, 3), dtype=torch.long)
+    positions_3d = torch.zeros((total_tokens, 3), dtype=torch.long)
 
+    cursor = 0
     for idx, (example, tokens, cached_positions, seq_len, sep_index, mapping) in enumerate(
         selected
     ):
         if mapping is not None:
             tokens = mapping[tokens]
-        input_ids[idx, :seq_len] = tokens
-        attention_mask[idx, :seq_len] = True
+        next_cursor = cursor + seq_len
+        input_ids[cursor:next_cursor] = tokens
         example_ids[idx] = example.example_id
         sep_indices[idx] = int(sep_index)
         if cached_positions is None:
             fake_batch = tokens.unsqueeze(0)
             mask = torch.ones_like(fake_batch, dtype=torch.bool)
             cached_positions = compute_positions_3d(fake_batch, mask).squeeze(0)
-        positions_3d[idx, :seq_len] = cached_positions
+        positions_3d[cursor:next_cursor] = cached_positions
+        cursor = next_cursor
+
+    cu_seqlens = torch.zeros(batch_size + 1, dtype=torch.int32)
+    cu_seqlens[1:] = torch.cumsum(seq_lengths, dim=0)
 
     return {
         "input_ids": input_ids,
-        "attention_mask": attention_mask,
-        "has_padding": has_padding,
+        "cu_seqlens": cu_seqlens,
+        "max_seqlen": max_len,
+        "has_padding": False,
         "example_ids": example_ids,
         "sep_indices": sep_indices,
         "positions_3d": positions_3d,
