@@ -128,11 +128,14 @@ def build_model_and_data(
     collate_augment_selector = None
     if augmentor is not None:
         collate_augment_selector = augmentor.select_for_example
+    # Keep eval behavior unchanged; training uses true random batching.
+    use_length_bucketing = bool(is_eval or getattr(args, "eval_only", False))
     dataloader = create_dataloader(
         dataset=dataset,
         batch_size=args.batch_size,
         shuffle=not getattr(args, "eval_only", False),
         augment_selector=collate_augment_selector,
+        use_length_bucketing=use_length_bucketing,
     )
     if augmentor is not None:
         dataloader.augmentor = augmentor

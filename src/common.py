@@ -762,15 +762,8 @@ def create_dataloader(
     augment_selector: Optional[
         Callable[[SequenceExample], Tuple[Optional[torch.Tensor], Optional[int]]]
     ] = None,
+    use_length_bucketing: bool = True,
 ) -> DataLoader:
-    lengths = getattr(dataset, "sequence_lengths", None)
-    if lengths is None:
-        lengths = [len(dataset[i].tokens) for i in range(len(dataset))]
-
-    bucket_size = max(batch_size * max(1, bucket_size_multiplier), batch_size)
-    batch_sampler = LengthBucketBatchSampler(
-        lengths=lengths, batch_size=batch_size, shuffle=shuffle, bucket_size=bucket_size
-    )
     if augment_selector is not None:
         collate_fn = functools.partial(
             collate_examples,
@@ -778,9 +771,28 @@ def create_dataloader(
         )
     else:
         collate_fn = collate_examples
+
+    if use_length_bucketing:
+        lengths = getattr(dataset, "sequence_lengths", None)
+        if lengths is None:
+            lengths = [len(dataset[i].tokens) for i in range(len(dataset))]
+
+        bucket_size = max(batch_size * max(1, bucket_size_multiplier), batch_size)
+        batch_sampler = LengthBucketBatchSampler(
+            lengths=lengths, batch_size=batch_size, shuffle=shuffle, bucket_size=bucket_size
+        )
+        return DataLoader(
+            dataset,
+            batch_sampler=batch_sampler,
+            num_workers=0,
+            collate_fn=collate_fn,
+        )
+
     return DataLoader(
         dataset,
-        batch_sampler=batch_sampler,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        drop_last=False,
         num_workers=0,
         collate_fn=collate_fn,
     )
