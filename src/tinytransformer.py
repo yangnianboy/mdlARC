@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Callable, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -9,17 +9,6 @@ try:
     from flash_attn import flash_attn_varlen_qkvpacked_func
 except ImportError:  # pragma: no cover - flash-attn optional at import time
     flash_attn_varlen_qkvpacked_func = None
-
-try:
-    from torch.nn.attention.flex_attention import (
-        and_masks,
-        create_block_mask,
-        flex_attention,
-    )
-except ImportError:  # pragma: no cover - older torch versions
-    and_masks = None
-    create_block_mask = None
-    flex_attention = None
 
 from common import (
     IGNORE_INDEX,
@@ -72,9 +61,6 @@ class MultiHeadSelfAttention(nn.Module):
         self.n_heads = config.n_heads
         self.head_dim = config.d_model // config.n_heads
         self.scale = self.head_dim**-0.5
-        self._has_flex_attention = (
-            flex_attention is not None and create_block_mask is not None
-        )
         self._has_flash_attn_varlen = flash_attn_varlen_qkvpacked_func is not None
 
         self.qkv_proj = nn.Linear(config.d_model, 3 * config.d_model, bias=False)
@@ -84,155 +70,6 @@ class MultiHeadSelfAttention(nn.Module):
 
         # 3D RoPE setup
         self.rope = RotaryEmbedding3D(self.head_dim)
-
-    def can_use_flex_attention(self, device: torch.device, dropout_p: float) -> bool:
-        del device, dropout_p
-        # Force SDPA (flash kernels) across training/inference paths.
-        return False
-
-    def _build_flex_mask_mod(
-        self,
-        attention_mask: Optional[torch.Tensor],
-        use_causal: bool,
-    ) -> Optional[
-        Callable[[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]
-    ]:
-        if attention_mask is None and not use_causal:
-            return None
-
-        def causal_mod(
-            b: torch.Tensor,
-            h: torch.Tensor,
-            q_idx: torch.Tensor,
-            kv_idx: torch.Tensor,
-        ) -> torch.Tensor:
-            del b, h
-            return q_idx >= kv_idx
-
-        if attention_mask is None:
-            return causal_mod
-
-        def padding_mod(
-            b: torch.Tensor,
-            h: torch.Tensor,
-            q_idx: torch.Tensor,
-            kv_idx: torch.Tensor,
-        ) -> torch.Tensor:
-            del h, q_idx
-            return attention_mask[b, kv_idx]
-
-        if use_causal:
-            if and_masks is not None:
-                return and_masks(causal_mod, padding_mod)
-
-            def causal_and_padding_mod(
-                b: torch.Tensor,
-                h: torch.Tensor,
-                q_idx: torch.Tensor,
-                kv_idx: torch.Tensor,
-            ) -> torch.Tensor:
-                del h
-                return (q_idx >= kv_idx) & attention_mask[b, kv_idx]
-
-            return causal_and_padding_mod
-
-        return padding_mod
-
-    def _build_flex_score_mod(
-        self,
-        attention_mask: Optional[torch.Tensor],
-        use_causal: bool,
-        neg_inf: torch.Tensor,
-        key_len: int,
-    ) -> Optional[
-        Callable[
-            [torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
-            torch.Tensor,
-        ]
-    ]:
-        if attention_mask is not None and attention_mask.size(1) < key_len:
-            raise ValueError(
-                "attention_mask length must cover all key/value positions."
-            )
-
-        if attention_mask is None and not use_causal:
-            return None
-
-        if attention_mask is None:
-
-            def score_mod(
-                score: torch.Tensor,
-                b: torch.Tensor,
-                h: torch.Tensor,
-                q_idx: torch.Tensor,
-                kv_idx: torch.Tensor,
-            ) -> torch.Tensor:
-                del b, h
-                return torch.where(q_idx >= kv_idx, score, neg_inf)
-
-            return score_mod
-
-        if use_causal:
-
-            def score_mod(
-                score: torch.Tensor,
-                b: torch.Tensor,
-                h: torch.Tensor,
-                q_idx: torch.Tensor,
-                kv_idx: torch.Tensor,
-            ) -> torch.Tensor:
-                del h
-                allowed = (q_idx >= kv_idx) & attention_mask[b, kv_idx]
-                return torch.where(allowed, score, neg_inf)
-
-            return score_mod
-
-        def score_mod(
-            score: torch.Tensor,
-            b: torch.Tensor,
-            h: torch.Tensor,
-            q_idx: torch.Tensor,
-            kv_idx: torch.Tensor,
-        ) -> torch.Tensor:
-            del h, q_idx
-            return torch.where(attention_mask[b, kv_idx], score, neg_inf)
-
-        return score_mod
-
-    def build_flex_block_mask(
-        self,
-        attention_mask: Optional[torch.Tensor],
-        use_causal: bool,
-        query_len: int,
-        key_len: int,
-        device: torch.device,
-        dropout_p: float,
-    ) -> Optional[object]:
-        if not self.can_use_flex_attention(device, dropout_p):
-            return None
-        if torch.compiler.is_compiling():
-            # Build-time block-mask creation can trigger graph breaks under
-            # fullgraph compile; use score_mod inside flex_attention instead.
-            return None
-
-        if attention_mask is not None and attention_mask.size(1) < key_len:
-            raise ValueError(
-                "attention_mask length must cover all key/value positions."
-            )
-
-        mask_mod = self._build_flex_mask_mod(attention_mask, use_causal)
-        if mask_mod is None:
-            return None
-
-        batch_dim = attention_mask.size(0) if attention_mask is not None else None
-        return create_block_mask(
-            mask_mod,
-            B=batch_dim,
-            H=None,
-            Q_LEN=query_len,
-            KV_LEN=key_len,
-            device=device,
-        )
 
     def _build_sdpa_attn_bias(
         self,
@@ -288,12 +125,9 @@ class MultiHeadSelfAttention(nn.Module):
         attention_mask: Optional[torch.Tensor],
         causal_mask: Optional[torch.Tensor],
         sdpa_mask: Optional[torch.Tensor],
-        flex_block_mask: Optional[object],
         dropout_p: float,
         is_causal: bool,
     ) -> torch.Tensor:
-        del flex_block_mask
-
         # Fast path: no explicit attn mask so SDPA can dispatch flash kernels.
         use_builtin_causal = bool(is_causal or causal_mask is not None)
         if sdpa_mask is None and attention_mask is None:
@@ -359,7 +193,6 @@ class MultiHeadSelfAttention(nn.Module):
         causal_mask: Optional[torch.Tensor] = None,
         pos_xyz: Optional[torch.Tensor] = None,
         sdpa_mask: Optional[torch.Tensor] = None,
-        flex_block_mask: Optional[object] = None,
         is_causal: bool = False,
         cu_seqlens: Optional[torch.Tensor] = None,
         max_seqlen: Optional[int] = None,
@@ -432,7 +265,6 @@ class MultiHeadSelfAttention(nn.Module):
             attention_mask=attention_mask,
             causal_mask=causal_mask,
             sdpa_mask=sdpa_mask,
-            flex_block_mask=flex_block_mask,
             dropout_p=self.dropout_p if self.training else 0.0,
             is_causal=is_causal,
         )
@@ -450,7 +282,6 @@ class MultiHeadSelfAttention(nn.Module):
         causal_mask: Optional[torch.Tensor] = None,
         past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         cache_position: Optional[torch.Tensor] = None,
-        flex_block_mask: Optional[object] = None,
     ) -> torch.Tensor:
         batch_size, seq_len, dim = hidden_states.shape
 
@@ -494,7 +325,6 @@ class MultiHeadSelfAttention(nn.Module):
                 attention_mask=attention_mask,
                 causal_mask=None,
                 sdpa_mask=None,
-                flex_block_mask=flex_block_mask,
                 dropout_p=0.0,
                 is_causal=False,
             )
@@ -516,7 +346,6 @@ class MultiHeadSelfAttention(nn.Module):
             attention_mask=attention_mask,
             causal_mask=causal_mask,
             sdpa_mask=None,
-            flex_block_mask=flex_block_mask,
             dropout_p=0.0,
             is_causal=causal_mask is not None,
         )
@@ -558,7 +387,6 @@ class TransformerBlock(nn.Module):
         causal_mask: Optional[torch.Tensor],
         pos_xyz: Optional[torch.Tensor],
         sdpa_mask: Optional[torch.Tensor] = None,
-        flex_block_mask: Optional[object] = None,
         is_causal: bool = False,
         cu_seqlens: Optional[torch.Tensor] = None,
         max_seqlen: Optional[int] = None,
@@ -570,7 +398,6 @@ class TransformerBlock(nn.Module):
             causal_mask=causal_mask,
             pos_xyz=pos_xyz,
             sdpa_mask=sdpa_mask,
-            flex_block_mask=flex_block_mask,
             is_causal=is_causal,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
@@ -590,7 +417,6 @@ class TransformerBlock(nn.Module):
         causal_mask: Optional[torch.Tensor] = None,
         past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         cache_position: Optional[torch.Tensor] = None,
-        flex_block_mask: Optional[object] = None,
     ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         attn_input = self.ln_1(hidden_states)
         # Check if we are in Decode mode or Prompt mode
@@ -604,7 +430,6 @@ class TransformerBlock(nn.Module):
                 causal_mask=causal_mask,
                 past_key_value=past_key_value,
                 cache_position=cache_position,
-                flex_block_mask=flex_block_mask,
             )
             present_key_value = None  # No return value needed
         else:
@@ -617,7 +442,6 @@ class TransformerBlock(nn.Module):
                 causal_mask=causal_mask,
                 past_key_value=None,
                 cache_position=None,
-                flex_block_mask=flex_block_mask,
             )
         hidden_states = hidden_states + attn_output
 
@@ -772,7 +596,6 @@ class TinyTransformer(nn.Module):
                 causal_mask=None,
                 pos_xyz=pos_xyz,
                 sdpa_mask=None,
-                flex_block_mask=None,
                 is_causal=True,
             )
             hidden_states = hidden_states * attention_mask.unsqueeze(-1)
@@ -921,7 +744,6 @@ class TinyTransformer(nn.Module):
                 causal_mask=None,
                 pos_xyz=pos_xyz,
                 sdpa_mask=None,
-                flex_block_mask=None,
                 is_causal=True,
                 cu_seqlens=cu_seqlens,
                 max_seqlen=max_seqlen_resolved,
@@ -1054,7 +876,6 @@ class TinyTransformer(nn.Module):
                     attention_mask=attention_mask,
                     causal_mask=causal_mask,
                     past_key_value=None,
-                    flex_block_mask=None,
                 )
                 past_key_values_out.append(present_kv)
 
@@ -1078,7 +899,6 @@ class TinyTransformer(nn.Module):
                 attention_mask=attention_mask,
                 past_key_value=past_key_values[i],
                 cache_position=cache_position,
-                flex_block_mask=None,
             )
         hidden_states = self.norm(hidden_states)
         logits = self.lm_head(hidden_states)
