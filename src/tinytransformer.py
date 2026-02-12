@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -9,6 +9,12 @@ try:
     from flash_attn import flash_attn_varlen_qkvpacked_func
 except ImportError:  # pragma: no cover - flash-attn optional at import time
     flash_attn_varlen_qkvpacked_func = None
+
+try:
+    from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+except ImportError:  # pragma: no cover - flex-attention optional at import time
+    create_block_mask = None
+    flex_attention = None
 
 from common import (
     IGNORE_INDEX,
@@ -62,6 +68,7 @@ class MultiHeadSelfAttention(nn.Module):
         self.head_dim = config.d_model // config.n_heads
         self.scale = self.head_dim**-0.5
         self._has_flash_attn_varlen = flash_attn_varlen_qkvpacked_func is not None
+        self._has_flex_attention = flex_attention is not None
 
         self.qkv_proj = nn.Linear(config.d_model, 3 * config.d_model, bias=False)
         self.out_proj = nn.Linear(config.d_model, config.d_model, bias=False)
@@ -154,6 +161,55 @@ class MultiHeadSelfAttention(nn.Module):
             attn_mask=attn_bias,
             dropout_p=dropout_p,
             is_causal=False,
+        )
+
+    def _apply_flex_decode_attention(
+        self,
+        queries: torch.Tensor,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+        attention_mask: torch.Tensor,
+        decode_block_mask: Optional[object] = None,
+    ) -> torch.Tensor:
+        if not self._has_flex_attention:
+            raise RuntimeError("flex_attention is not available.")
+        if attention_mask.dim() != 2:
+            raise ValueError("Decode attention_mask must have shape [batch, key_len].")
+        if attention_mask.size(0) != queries.size(0):
+            raise ValueError("Decode attention_mask batch size must match query batch size.")
+        if attention_mask.size(1) < keys.size(2):
+            raise ValueError("Decode attention_mask must cover all key/value positions.")
+
+        key_len = keys.size(2)
+        mask = attention_mask[:, :key_len]
+
+        if decode_block_mask is not None:
+            return flex_attention(
+                queries,
+                keys,
+                values,
+                block_mask=decode_block_mask,
+                scale=self.scale,
+            )
+
+        # Fallback path for environments where create_block_mask is unavailable.
+        def decode_score_mod(
+            score: torch.Tensor,
+            b: torch.Tensor,
+            h: torch.Tensor,
+            q_idx: torch.Tensor,
+            kv_idx: torch.Tensor,
+        ) -> torch.Tensor:
+            del h, q_idx
+            is_valid = mask[b, kv_idx]
+            return torch.where(is_valid, score, score.new_full((), float("-inf")))
+
+        return flex_attention(
+            queries,
+            keys,
+            values,
+            score_mod=decode_score_mod,
+            scale=self.scale,
         )
 
     def _apply_varlen_flash_attention(
@@ -282,6 +338,7 @@ class MultiHeadSelfAttention(nn.Module):
         causal_mask: Optional[torch.Tensor] = None,
         past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         cache_position: Optional[torch.Tensor] = None,
+        decode_block_mask: Optional[object] = None,
     ) -> torch.Tensor:
         batch_size, seq_len, dim = hidden_states.shape
 
@@ -318,16 +375,30 @@ class MultiHeadSelfAttention(nn.Module):
                 key_layer = past_keys
                 value_layer = past_values
 
-            attn_output = self._apply_attention(
-                queries,
-                key_layer,
-                value_layer,
-                attention_mask=attention_mask,
-                causal_mask=None,
-                sdpa_mask=None,
-                dropout_p=0.0,
-                is_causal=False,
+            use_flex_decode = (
+                self._has_flex_attention
+                and queries.device.type == "cuda"
+                and attention_mask is not None
             )
+            if use_flex_decode:
+                attn_output = self._apply_flex_decode_attention(
+                    queries,
+                    key_layer,
+                    value_layer,
+                    attention_mask=attention_mask,
+                    decode_block_mask=decode_block_mask,
+                )
+            else:
+                attn_output = self._apply_attention(
+                    queries,
+                    key_layer,
+                    value_layer,
+                    attention_mask=attention_mask,
+                    causal_mask=None,
+                    sdpa_mask=None,
+                    dropout_p=0.0,
+                    is_causal=False,
+                )
 
             attn_output = (
                 attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, dim)
@@ -417,6 +488,7 @@ class TransformerBlock(nn.Module):
         causal_mask: Optional[torch.Tensor] = None,
         past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         cache_position: Optional[torch.Tensor] = None,
+        decode_block_mask: Optional[object] = None,
     ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         attn_input = self.ln_1(hidden_states)
         # Check if we are in Decode mode or Prompt mode
@@ -430,6 +502,7 @@ class TransformerBlock(nn.Module):
                 causal_mask=causal_mask,
                 past_key_value=past_key_value,
                 cache_position=cache_position,
+                decode_block_mask=decode_block_mask,
             )
             present_key_value = None  # No return value needed
         else:
@@ -491,6 +564,10 @@ class TinyTransformer(nn.Module):
 
         self.apply(self._init_weights)
 
+        # Decode block-mask cache keyed by (device_type, device_index, kv_len, block_idx).
+        self._decode_block_mask_cache: Dict[Tuple[str, int, int, int], object] = {}
+        self._decode_block_size = 128
+
     def _init_weights(self, module: nn.Module) -> None:
         if isinstance(module, nn.Linear):
             nn.init.xavier_uniform_(module.weight)
@@ -504,6 +581,98 @@ class TinyTransformer(nn.Module):
             torch.ones(seq_len, seq_len, device=device, dtype=torch.bool), diagonal=1
         )
         return mask[None, None, :, :]
+
+    def _get_decode_block_mask(
+        self, cache_position: int, kv_len: int, device: torch.device
+    ) -> Optional[object]:
+        if create_block_mask is None or kv_len < 1:
+            return None
+
+        block_idx = max(int(cache_position), 0) // self._decode_block_size
+        device_index = -1 if device.index is None else int(device.index)
+        cache_key = (device.type, device_index, int(kv_len), block_idx)
+        cached = self._decode_block_mask_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        block_end = min(((block_idx + 1) * self._decode_block_size) - 1, kv_len - 1)
+
+        def block_superset_mask(
+            b: torch.Tensor,
+            h: torch.Tensor,
+            q_idx: torch.Tensor,
+            kv_idx: torch.Tensor,
+        ) -> torch.Tensor:
+            del b, h, q_idx
+            return kv_idx <= block_end
+
+        build_kwargs: Dict[str, Any] = {
+            "mask_mod": block_superset_mask,
+            "B": None,
+            "H": None,
+            "Q_LEN": 1,
+            "KV_LEN": int(kv_len),
+            "device": device,
+            "BLOCK_SIZE": self._decode_block_size,
+        }
+        try:
+            block_mask = create_block_mask(_compile=True, **build_kwargs)
+        except TypeError:
+            try:
+                block_mask = create_block_mask(**build_kwargs)
+            except TypeError:
+                # Backward-compatible fallback for older signatures.
+                block_mask = create_block_mask(
+                    block_superset_mask,
+                    1,
+                    1,
+                    1,
+                    int(kv_len),
+                    device=device,
+                    BLOCK_SIZE=self._decode_block_size,
+                )
+
+        self._decode_block_mask_cache[cache_key] = block_mask
+        return block_mask
+
+    def build_decode_block_mask_for_step(
+        self,
+        attention_mask: Optional[torch.Tensor],
+        cache_position: Optional[torch.Tensor],
+        kv_len: int,
+        device: torch.device,
+    ) -> Optional[object]:
+        if attention_mask is None or cache_position is None:
+            return None
+        if attention_mask.dim() != 2:
+            return None
+        if attention_mask.size(1) < kv_len:
+            return None
+
+        cache_pos = int(cache_position.reshape(-1)[0].item())
+        block_mask = self._get_decode_block_mask(cache_pos, kv_len=kv_len, device=device)
+        if block_mask is None:
+            return None
+
+        key_mask = attention_mask[:, :kv_len]
+        q_offset = cache_position.reshape(-1)[0]
+
+        def decode_mask_mod(
+            b: torch.Tensor,
+            h: torch.Tensor,
+            q_idx: torch.Tensor,
+            kv_idx: torch.Tensor,
+        ) -> torch.Tensor:
+            del h
+            causal_ok = q_idx + q_offset >= kv_idx
+            key_ok = key_mask[b, kv_idx]
+            return causal_ok & key_ok
+
+        try:
+            block_mask.mask_mod = decode_mask_mod
+        except Exception:
+            return None
+        return block_mask
 
     def forward(
         self,
@@ -810,6 +979,7 @@ class TinyTransformer(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         cache_position: Optional[torch.Tensor] = None,
         example_embeds: Optional[torch.Tensor] = None,
+        decode_block_mask: Optional[object] = None,
     ) -> dict:
         """Forward used for autoregressive generation with a KV cache.
 
@@ -880,7 +1050,8 @@ class TinyTransformer(nn.Module):
                 past_key_values_out.append(present_kv)
 
             hidden_states = self.norm(hidden_states)
-            logits = self.lm_head(hidden_states)
+            # Prefill only needs next-token logits; avoid projecting the full prompt.
+            logits = self.lm_head(hidden_states[:, -1:, :])
             return {"logits": logits, "past_key_values": tuple(past_key_values_out)}
 
         if pos_xyz is None:
@@ -899,6 +1070,7 @@ class TinyTransformer(nn.Module):
                 attention_mask=attention_mask,
                 past_key_value=past_key_values[i],
                 cache_position=cache_position,
+                decode_block_mask=decode_block_mask,
             )
         hidden_states = self.norm(hidden_states)
         logits = self.lm_head(hidden_states)

@@ -83,15 +83,14 @@ def _compiled_grid_update(state, token_ids, start_id, sep_id, end_id, nl_id):
 
 class BatchGridState:
     def __init__(self, initial_state: torch.Tensor) -> None:
-        self.state = initial_state.clone().long()
+        self.state = initial_state.long()
 
     def update(self, token_ids: torch.Tensor) -> torch.Tensor:
         token_ids = token_ids.view(-1).to(device=self.state.device)
         self.state, positions = _compiled_grid_update(
             self.state, token_ids, START_TOKEN_ID, IO_SEPARATOR_TOKEN_ID, END_TOKEN_ID, NEXT_LINE_TOKEN_ID
         )
-        self.state = self.state.clone()
-        return positions.clone()
+        return positions
 
 
 def _select_next_token(logits: torch.Tensor, temperature: Optional[float] = None, top_k: Optional[int] = None) -> torch.Tensor:
@@ -169,7 +168,6 @@ def batched_greedy_generate(
     cached_positions=None, temperature: Optional[float] = None, top_k: Optional[int] = None,
 ):
     model.eval()
-    model.to(dtype=torch.bfloat16)
     batch_size = len(prompts)
 
     example_ids_tensor = torch.tensor(example_ids, dtype=torch.long, device=device)
@@ -226,11 +224,21 @@ def batched_greedy_generate(
         generated_tokens_buffer[:, step_i] = next_token
         finished = finished | (next_token == END_TOKEN_ID)
         token_positions = grid_state.update(next_token).unsqueeze(1)
-        full_attention_mask.index_fill_(1, cache_position, True)
+        active_rows = ~finished
+        full_attention_mask[:, cache_position] = active_rows.unsqueeze(1)
+        decode_block_mask = None
+        if hasattr(model, "build_decode_block_mask_for_step"):
+            decode_block_mask = model.build_decode_block_mask_for_step(
+                attention_mask=full_attention_mask,
+                cache_position=cache_position,
+                kv_len=max_model_len,
+                device=device,
+            )
         outputs = model._compiled_decode(
             input_ids=next_token.unsqueeze(1), example_ids=example_ids_tensor,
             past_key_values=past_key_values, positions_3d=token_positions,
             attention_mask=full_attention_mask, cache_position=cache_position, example_embeds=example_embeds,
+            decode_block_mask=decode_block_mask,
         )
         logits = outputs["logits"]
         cache_position.add_(1)
@@ -452,6 +460,10 @@ def run_split_inference(
     temperature: Optional[float] = None, top_k: Optional[int] = None,
     augmentor: Optional[Augmentor] = None,
 ) -> Tuple[List[Dict[str, object]], Dict[str, List[List[int]]], bool]:
+    model.eval()
+    if next(model.parameters()).dtype != torch.bfloat16:
+        model.to(dtype=torch.bfloat16)
+
     examples = _gather_examples_for_split(
         dataset, split=split, task_ids=task_ids, pair_index=pair_index,
     )
