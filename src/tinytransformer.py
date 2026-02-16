@@ -922,20 +922,18 @@ class TinyTransformer(nn.Module):
 
         example_ids = example_ids.to(device=device, dtype=torch.long)
         dihedral_ids = dihedral_ids.to(device=device, dtype=torch.long)
-        token_example_ids = torch.repeat_interleave(
-            example_ids,
-            seq_lengths,
-        )
-        token_dihedral_ids = torch.repeat_interleave(
-            dihedral_ids,
-            seq_lengths,
-        )
         token_embeds = self.token_embedding(input_ids)
-        hidden_states = (
-            token_embeds
-            + self.example_embedding(token_example_ids)
-            + self.dihedral_embedding(token_dihedral_ids)
+
+        # Build per-sequence conditioning once, then broadcast to packed tokens.
+        sequence_embeds = self.example_embedding(example_ids) + self.dihedral_embedding(
+            dihedral_ids
         )
+        token_sequence_embeds = torch.repeat_interleave(
+            sequence_embeds,
+            seq_lengths,
+            dim=0,
+        )
+        hidden_states = token_embeds + token_sequence_embeds
         hidden_states = self.dropout(hidden_states)
 
         pos_xyz = positions_3d.to(device=device, dtype=torch.long)
