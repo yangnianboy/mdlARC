@@ -52,10 +52,12 @@ args_dict = {
     "weight_decay": 0.1,
     "attention_weight_decay": 0.01,
     "token_embedding_weight_decay": 0.01,
-    "task_embedding_weight_decay": 0.01,
+    "task_embedding_weight_decay": 0.01,  # Applies to task/example and dihedral embeddings.
 
     "grad_clip": 1.0,
     "dropout": 0.1,
+    # Let attention dropout follow the shared dropout knob.
+    "attention_dropout": None,
     "seed": 42,
 
     # Architecture
@@ -66,6 +68,10 @@ args_dict = {
 
     "inference_temperature": None,
     "inference_top_k": None,
+
+    # train logging
+    "train_log_mode": "10_steps", # options: never, step, 10_steps, epoch
+    "log_location": "both", # options: none, terminal, file, both.
 }
 cfg = argparse.Namespace(**args_dict) # Convert dictionary to Namespace
 Path("runs").mkdir(parents=True, exist_ok=True) # Create runs dir

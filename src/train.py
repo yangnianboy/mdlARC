@@ -7,9 +7,10 @@ For model/data building, see build.py.
 import argparse
 import math
 import numbers
+import os
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Dict, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, TextIO, Tuple
 
 import torch
 from torch import nn
@@ -48,7 +49,7 @@ def _zeropower_via_newtonschulz5(G, steps=5):
 
 def _normuon_update(grad, momentum, second_momentum, beta=0.95, beta2=0.95, ns_steps=5, nesterov=True):
     momentum.lerp_(grad, 1 - beta)
-    update = grad.lerp_(momentum, beta) if nesterov else momentum
+    update = torch.lerp(grad, momentum, beta) if nesterov else momentum
     original_shape = None
     if update.ndim == 4:
         original_shape = update.shape
@@ -99,6 +100,91 @@ class SingleDeviceNorMuonWithAuxAdam(torch.optim.Optimizer):
                 }
         super().__init__(param_groups, dict())
 
+        self._normuon_update_fn: Callable[..., torch.Tensor] = _normuon_update
+        self._adam_update_fn: Callable[..., torch.Tensor] = _adam_update
+        self._compiled_update_kernels = False
+        self._zero_scalars: Dict[Tuple[torch.device, torch.dtype], torch.Tensor] = {}
+
+        disable_compile = str(
+            os.environ.get("MDLARC_DISABLE_OPTIMIZER_COMPILE", "0")
+        ).lower() in {"1", "true", "yes", "on"}
+        has_cuda_params = any(
+            p.is_cuda for group in param_groups for p in group["params"]
+        )
+        if has_cuda_params and hasattr(torch, "compile") and not disable_compile:
+            try:
+                self._normuon_update_fn = torch.compile(
+                    _normuon_update,
+                    mode="reduce-overhead",
+                    fullgraph=False,
+                    dynamic=True,
+                )
+                self._adam_update_fn = torch.compile(
+                    _adam_update,
+                    mode="reduce-overhead",
+                    fullgraph=False,
+                    dynamic=True,
+                )
+                self._compiled_update_kernels = True
+                print("Compiled NorMuon optimizer update kernels.")
+            except Exception as exc:
+                print(f"Skipping NorMuon optimizer kernel compile ({exc}).")
+
+    def _get_zero_grad(self, p: torch.Tensor) -> torch.Tensor:
+        key = (p.device, p.dtype)
+        zero = self._zero_scalars.get(key)
+        if zero is None:
+            zero = torch.zeros((), device=p.device, dtype=p.dtype)
+            self._zero_scalars[key] = zero
+        return zero.expand_as(p)
+
+    def _call_normuon_update(
+        self,
+        grad: torch.Tensor,
+        momentum: torch.Tensor,
+        second_momentum: torch.Tensor,
+        beta: float,
+        beta2: float,
+    ) -> torch.Tensor:
+        if not self._compiled_update_kernels:
+            return _normuon_update(grad, momentum, second_momentum, beta=beta, beta2=beta2)
+        try:
+            return self._normuon_update_fn(
+                grad, momentum, second_momentum, beta=beta, beta2=beta2
+            )
+        except Exception as exc:
+            print(
+                "Compiled NorMuon kernels failed during step "
+                f"({exc}); falling back to eager optimizer updates."
+            )
+            self._compiled_update_kernels = False
+            self._normuon_update_fn = _normuon_update
+            self._adam_update_fn = _adam_update
+            return _normuon_update(grad, momentum, second_momentum, beta=beta, beta2=beta2)
+
+    def _call_adam_update(
+        self,
+        grad: torch.Tensor,
+        buf1: torch.Tensor,
+        buf2: torch.Tensor,
+        step: int,
+        betas: Tuple[float, float],
+        eps: float,
+    ) -> torch.Tensor:
+        if not self._compiled_update_kernels:
+            return _adam_update(grad, buf1, buf2, step, betas, eps)
+        try:
+            return self._adam_update_fn(grad, buf1, buf2, step, betas, eps)
+        except Exception as exc:
+            print(
+                "Compiled NorMuon kernels failed during step "
+                f"({exc}); falling back to eager optimizer updates."
+            )
+            self._compiled_update_kernels = False
+            self._normuon_update_fn = _normuon_update
+            self._adam_update_fn = _adam_update
+            return _adam_update(grad, buf1, buf2, step, betas, eps)
+
     @torch.no_grad()
     def step(self, closure=None):
         loss = None
@@ -108,52 +194,178 @@ class SingleDeviceNorMuonWithAuxAdam(torch.optim.Optimizer):
 
         for group in self.param_groups:
             if group["use_muon"]:
+                lr = float(group["lr"])
+                beta = float(group["momentum"])
+                beta2 = float(group["beta2"])
+                weight_decay = float(group["weight_decay"])
+
+                buckets: Dict[
+                    Tuple[Tuple[int, ...], torch.dtype, torch.device], List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, bool]]
+                ] = {}
                 for p in group["params"]:
-                    had_grad = p.grad is not None
-                    if not had_grad:
-                        p.grad = torch.zeros_like(p)
+                    grad = p.grad
+                    had_grad = grad is not None
+                    if grad is None:
+                        grad = self._get_zero_grad(p)
                     state = self.state[p]
                     if len(state) == 0:
                         state["momentum_buffer"] = torch.zeros_like(p)
                         state["second_momentum_buffer"] = torch.zeros_like(p[..., 0:1])
-                    update = _normuon_update(
-                        p.grad,
-                        state["momentum_buffer"],
-                        state["second_momentum_buffer"],
-                        beta=group["momentum"],
-                        beta2=group["beta2"],
+                    key = (tuple(p.shape), p.dtype, p.device)
+                    bucket = buckets.setdefault(key, [])
+                    bucket.append(
+                        (
+                            p,
+                            grad,
+                            state["momentum_buffer"],
+                            state["second_momentum_buffer"],
+                            had_grad,
+                        )
                     )
-                    if group["weight_decay"] and had_grad:
-                        p.mul_(1 - group["lr"] * group["weight_decay"])
-                    p.add_(update.reshape(p.shape), alpha=-group["lr"])
+
+                params_to_update: List[torch.Tensor] = []
+                updates: List[torch.Tensor] = []
+                params_with_grad: List[torch.Tensor] = []
+
+                for bucket in buckets.values():
+                    if len(bucket) == 1:
+                        p, grad, momentum_buffer, second_momentum_buffer, had_grad = bucket[0]
+                        update = self._call_normuon_update(
+                            grad,
+                            momentum_buffer,
+                            second_momentum_buffer,
+                            beta,
+                            beta2,
+                        )
+                        params_to_update.append(p)
+                        updates.append(update.reshape_as(p))
+                        if weight_decay and had_grad:
+                            params_with_grad.append(p)
+                        continue
+
+                    grad_batch = torch.stack([item[1] for item in bucket], dim=0)
+                    momentum_batch = torch.stack([item[2] for item in bucket], dim=0)
+                    second_momentum_batch = torch.stack(
+                        [item[3] for item in bucket], dim=0
+                    )
+                    update_batch = self._call_normuon_update(
+                        grad_batch,
+                        momentum_batch,
+                        second_momentum_batch,
+                        beta,
+                        beta2,
+                    )
+
+                    for idx, (
+                        p,
+                        _grad,
+                        momentum_buffer,
+                        second_momentum_buffer,
+                        had_grad,
+                    ) in enumerate(bucket):
+                        momentum_buffer.copy_(momentum_batch[idx])
+                        second_momentum_buffer.copy_(second_momentum_batch[idx])
+                        params_to_update.append(p)
+                        updates.append(update_batch[idx].reshape_as(p))
+                        if weight_decay and had_grad:
+                            params_with_grad.append(p)
+
+                if weight_decay and params_with_grad:
+                    torch._foreach_mul_(params_with_grad, 1 - lr * weight_decay)
+                if params_to_update:
+                    torch._foreach_add_(params_to_update, updates, alpha=-lr)
             else:
+                lr = float(group["lr"])
+                betas = group["betas"]
+                beta1 = float(betas[0])
+                beta2 = float(betas[1])
+                eps = float(group["eps"])
+                weight_decay = float(group["weight_decay"])
+
+                params: List[torch.Tensor] = []
+                grads: List[torch.Tensor] = []
+                exp_avgs: List[torch.Tensor] = []
+                exp_avg_sqs: List[torch.Tensor] = []
+                steps: List[int] = []
+                params_with_grad: List[torch.Tensor] = []
+
                 for p in group["params"]:
-                    had_grad = p.grad is not None
-                    if not had_grad:
-                        p.grad = torch.zeros_like(p)
+                    grad = p.grad
+                    had_grad = grad is not None
+                    if grad is None:
+                        grad = self._get_zero_grad(p)
                     state = self.state[p]
                     if len(state) == 0:
                         state["exp_avg"] = torch.zeros_like(p)
                         state["exp_avg_sq"] = torch.zeros_like(p)
                         state["step"] = 0
                     state["step"] += 1
-                    update = _adam_update(
-                        p.grad,
-                        state["exp_avg"],
-                        state["exp_avg_sq"],
-                        state["step"],
-                        group["betas"],
-                        group["eps"],
+                    step = int(state["step"])
+
+                    params.append(p)
+                    grads.append(grad)
+                    exp_avgs.append(state["exp_avg"])
+                    exp_avg_sqs.append(state["exp_avg_sq"])
+                    steps.append(step)
+                    if weight_decay and had_grad:
+                        params_with_grad.append(p)
+
+                if not params:
+                    continue
+
+                all_same_step = all(step == steps[0] for step in steps)
+                if all_same_step:
+                    torch._foreach_lerp_(exp_avgs, grads, 1 - beta1)
+                    torch._foreach_mul_(exp_avg_sqs, beta2)
+                    torch._foreach_addcmul_(
+                        exp_avg_sqs,
+                        grads,
+                        grads,
+                        value=1 - beta2,
                     )
-                    if group["weight_decay"] and had_grad:
-                        p.mul_(1 - group["lr"] * group["weight_decay"])
-                    p.add_(update, alpha=-group["lr"])
+
+                    step_value = steps[0]
+                    bias_correction1 = 1 - beta1**step_value
+                    bias_correction2 = 1 - beta2**step_value
+
+                    updates = torch._foreach_div(exp_avgs, bias_correction1)
+                    denoms = torch._foreach_sqrt(exp_avg_sqs)
+                    torch._foreach_div_(denoms, math.sqrt(bias_correction2))
+                    torch._foreach_add_(denoms, eps)
+                    updates = torch._foreach_div(updates, denoms)
+                else:
+                    updates = []
+                    for grad, exp_avg, exp_avg_sq, step in zip(
+                        grads, exp_avgs, exp_avg_sqs, steps
+                    ):
+                        updates.append(
+                            self._call_adam_update(
+                                grad,
+                                exp_avg,
+                                exp_avg_sq,
+                                step,
+                                betas,
+                                eps,
+                            )
+                        )
+
+                if weight_decay and params_with_grad:
+                    torch._foreach_mul_(params_with_grad, 1 - lr * weight_decay)
+                torch._foreach_add_(params, updates, alpha=-lr)
         return loss
 
 
 # =============================================================================
 # Training One Epoch
 # =============================================================================
+
+def _emit_log(message: str, log_location: str, log_handle: Optional[TextIO]) -> None:
+    if log_location in ("terminal", "both"):
+        print(message)
+    if log_location in ("file", "both") and log_handle is not None:
+        log_handle.write(message + "\n")
+        log_handle.flush()
+
 
 def train_one_epoch(
     model: TinyTransformer,
@@ -163,16 +375,15 @@ def train_one_epoch(
     grad_clip: float,
     gradient_accumulation_steps: int = 1,
     start_step: int = 0,
-    log_file: Optional[Path] = None,
     scheduler: Optional[torch.optim.lr_scheduler.LRScheduler] = None,
     epoch: Optional[int] = None,
     steps_per_epoch: Optional[int] = None,
+    train_log_mode: str = "10_steps",
+    log_location: str = "both",
+    log_handle: Optional[TextIO] = None,
 ) -> int:
     model.train()
     step = start_step
-    total_loss = 0.0
-    total_input_loss = 0.0
-    total_output_loss = 0.0
     use_amp = device.type == "cuda"
 
     if steps_per_epoch is None:
@@ -184,14 +395,81 @@ def train_one_epoch(
     accum_index = 0
     accum_target = accum_steps
     dataloader_length = steps_per_epoch if steps_per_epoch is not None else None
+    optimizer_step = 0
+
+    window_loss_sum = torch.zeros((), device=device, dtype=torch.float32)
+    window_input_sum = torch.zeros((), device=device, dtype=torch.float32)
+    window_output_sum = torch.zeros((), device=device, dtype=torch.float32)
+    window_count = 0
+
+    epoch_loss_sum = torch.zeros((), device=device, dtype=torch.float32)
+    epoch_input_sum = torch.zeros((), device=device, dtype=torch.float32)
+    epoch_output_sum = torch.zeros((), device=device, dtype=torch.float32)
+    epoch_count = 0
+
+    def maybe_log_window(force: bool = False) -> None:
+        nonlocal window_count
+        should_log = False
+        if train_log_mode == "step":
+            should_log = True
+        elif train_log_mode == "10_steps":
+            should_log = (optimizer_step % 10 == 0) or force
+        if not should_log or window_count == 0:
+            return
+
+        avg_loss = (window_loss_sum / window_count).item()
+        avg_inp = (window_input_sum / window_count).item()
+        avg_out = (window_output_sum / window_count).item()
+        current_lr = (
+            scheduler.get_last_lr()[0]
+            if scheduler
+            else optimizer.param_groups[0]["lr"]
+        )
+        if epoch is None:
+            prefix = f"step={optimizer_step}"
+        else:
+            prefix = f"epoch={epoch + 1} step={optimizer_step}"
+        log_msg = (
+            f"{prefix} lr={current_lr:.2e} losses: avg={avg_loss:.4f} "
+            f"inp={avg_inp:.4f} out={avg_out:.4f}"
+        )
+        _emit_log(log_msg, log_location, log_handle)
+        window_loss_sum.zero_()
+        window_input_sum.zero_()
+        window_output_sum.zero_()
+        window_count = 0
 
     last_batch_idx = None
     for batch_idx, batch in enumerate(dataloader):
         last_batch_idx = batch_idx
         step += 1
         input_ids = batch["input_ids"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
+        sep_indices_cpu = batch.get("sep_indices")
+        sep_indices = (
+            sep_indices_cpu.to(device) if sep_indices_cpu is not None else None
+        )
+        cu_seqlens_cpu = batch.get("cu_seqlens")
+        if cu_seqlens_cpu is not None:
+            cu_seqlens = cu_seqlens_cpu.to(device=device, dtype=torch.int32)
+            max_seqlen_raw = batch.get("max_seqlen")
+            if max_seqlen_raw is None:
+                raise ValueError("Packed batches must include max_seqlen.")
+            max_seqlen = (
+                int(max_seqlen_raw.item())
+                if torch.is_tensor(max_seqlen_raw)
+                else int(max_seqlen_raw)
+            )
+            attention_mask = None
+        else:
+            cu_seqlens = None
+            max_seqlen = None
+            has_padding = bool(batch.get("has_padding", True))
+            if not has_padding:
+                attention_mask = None
+            else:
+                attention_mask = batch["attention_mask"].to(device)
         example_ids = batch["example_ids"].to(device)
+        dihedral_ids = batch["dihedral_ids"].to(device)
         positions_3d = batch["positions_3d"].to(device)
         if accum_index == 0:
             optimizer.zero_grad(set_to_none=True)
@@ -207,16 +485,31 @@ def train_one_epoch(
             outputs = model(
                 input_ids,
                 example_ids,
+                dihedral_ids,
                 attention_mask=attention_mask,
+                sep_indices=sep_indices,
+                compute_input_loss=False,
                 positions_3d=positions_3d,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
             )
-            loss = outputs["loss"]
+            loss = outputs["output_loss"]
             inp_loss = outputs.get("input_loss")
             out_loss = outputs.get("output_loss")
 
-        loss_value = loss.item()
-        inp_loss_value = inp_loss.item() if inp_loss is not None else 0.0
-        out_loss_value = out_loss.item() if out_loss is not None else 0.0
+        batch_loss = loss.detach().float()
+        window_loss_sum += batch_loss
+        epoch_loss_sum += batch_loss
+        if inp_loss is not None:
+            batch_inp_loss = inp_loss.detach().float()
+            window_input_sum += batch_inp_loss
+            epoch_input_sum += batch_inp_loss
+        if out_loss is not None:
+            batch_out_loss = out_loss.detach().float()
+            window_output_sum += batch_out_loss
+            epoch_output_sum += batch_out_loss
+        window_count += 1
+        epoch_count += 1
 
         loss = loss / accum_target
         loss.backward()
@@ -235,33 +528,8 @@ def train_one_epoch(
                     )
                     scheduler.step(epoch_progress)
             accum_index = 0
-
-        total_loss += loss_value
-        total_input_loss += inp_loss_value
-        total_output_loss += out_loss_value
-
-        if step % 10 == 0:
-            avg_loss = total_loss / 10
-            avg_inp = total_input_loss / 10
-            avg_out = total_output_loss / 10
-
-            current_lr = (
-                scheduler.get_last_lr()[0]
-                if scheduler
-                else optimizer.param_groups[0]["lr"]
-            )
-
-            log_msg = f"step={step} lr={current_lr:.2e} losses: avg={avg_loss:.4f} inp={avg_inp:.4f} out={avg_out:.4f}"
-            print(log_msg)
-
-            if log_file:
-                log_file.parent.mkdir(parents=True, exist_ok=True)
-                with open(log_file, "a") as f:
-                    f.write(log_msg + "\n")
-
-            total_loss = 0.0
-            total_input_loss = 0.0
-            total_output_loss = 0.0
+            optimizer_step += 1
+            maybe_log_window()
     if accum_index > 0:
         if grad_clip > 0:
             nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
@@ -274,6 +542,29 @@ def train_one_epoch(
                     steps_per_epoch
                 )
                 scheduler.step(epoch_progress)
+        optimizer_step += 1
+        maybe_log_window()
+
+    if train_log_mode == "10_steps":
+        maybe_log_window(force=True)
+    elif train_log_mode == "epoch" and epoch_count > 0:
+        avg_loss = (epoch_loss_sum / epoch_count).item()
+        avg_inp = (epoch_input_sum / epoch_count).item()
+        avg_out = (epoch_output_sum / epoch_count).item()
+        current_lr = (
+            scheduler.get_last_lr()[0]
+            if scheduler
+            else optimizer.param_groups[0]["lr"]
+        )
+        if epoch is None:
+            prefix = "epoch"
+        else:
+            prefix = f"epoch={epoch + 1}"
+        log_msg = (
+            f"{prefix} lr={current_lr:.2e} losses: avg={avg_loss:.4f} "
+            f"inp={avg_inp:.4f} out={avg_out:.4f}"
+        )
+        _emit_log(log_msg, log_location, log_handle)
     return step
 
 
@@ -289,38 +580,67 @@ def validate_one_epoch(
 ) -> float:
     """Calculates validation loss (Output Loss) on the test set."""
     model.eval()
-    total_loss_sum = 0.0
-    total_tokens = 0
+    use_amp = device.type == "cuda"
+    total_loss_sum = torch.zeros((), device=device, dtype=torch.float32)
+    total_tokens = torch.zeros((), device=device, dtype=torch.float32)
 
     for batch in dataloader:
         input_ids = batch["input_ids"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
+        sep_indices_cpu = batch.get("sep_indices")
+        sep_indices = (
+            sep_indices_cpu.to(device) if sep_indices_cpu is not None else None
+        )
+        cu_seqlens_cpu = batch.get("cu_seqlens")
+        if cu_seqlens_cpu is not None:
+            cu_seqlens = cu_seqlens_cpu.to(device=device, dtype=torch.int32)
+            max_seqlen_raw = batch.get("max_seqlen")
+            if max_seqlen_raw is None:
+                raise ValueError("Packed batches must include max_seqlen.")
+            max_seqlen = (
+                int(max_seqlen_raw.item())
+                if torch.is_tensor(max_seqlen_raw)
+                else int(max_seqlen_raw)
+            )
+            attention_mask = None
+        else:
+            cu_seqlens = None
+            max_seqlen = None
+            has_padding = bool(batch.get("has_padding", True))
+            if not has_padding:
+                attention_mask = None
+            else:
+                attention_mask = batch["attention_mask"].to(device)
         example_ids = batch["example_ids"].to(device)
+        dihedral_ids = batch["dihedral_ids"].to(device)
         positions_3d = batch["positions_3d"].to(device)
 
         if not any(batch["has_output"]):
             continue
 
-        outputs = model(
-            input_ids,
-            example_ids,
-            attention_mask=attention_mask,
-            positions_3d=positions_3d,
-        )
+        with torch.autocast(
+            device_type=device.type, dtype=torch.bfloat16, enabled=use_amp
+        ):
+            outputs = model(
+                input_ids,
+                example_ids,
+                dihedral_ids,
+                attention_mask=attention_mask,
+                sep_indices=sep_indices,
+                compute_input_loss=False,
+                positions_3d=positions_3d,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+            )
 
         out_loss = outputs.get("output_loss")
         num_tokens = outputs.get("num_output_tokens")
 
         if out_loss is not None and num_tokens is not None:
-            n = num_tokens.item()
-            if n > 0:
-                total_loss_sum += out_loss.item() * n
-                total_tokens += n
+            n = num_tokens.detach().to(dtype=torch.float32)
+            total_loss_sum += out_loss.detach().float() * n
+            total_tokens += n
 
-    if total_tokens == 0:
-        return 0.0
-
-    return total_loss_sum / total_tokens
+    return (total_loss_sum / total_tokens.clamp_min(1.0)).item()
 
 
 # =============================================================================
@@ -415,7 +735,9 @@ def _collect_param_groups(
         if isinstance(module, nn.Embedding):
             if name.startswith("token_embedding."):
                 groups["token_embed"].append(param)
-            elif name.startswith("example_embedding."):
+            elif name.startswith("example_embedding.") or name.startswith(
+                "dihedral_embedding."
+            ):
                 groups["task_embed"].append(param)
             else:
                 groups["no_decay"].append(param)
@@ -822,6 +1144,14 @@ def train_model(
         print("Validation disabled (skipping solutions.json load).")
 
     log_file = getattr(args, "train_log_file", None)
+    if log_file is not None and not isinstance(log_file, Path):
+        log_file = Path(log_file)
+    train_log_mode = str(getattr(args, "train_log_mode", "10_steps"))
+    log_location = str(getattr(args, "log_location", "both"))
+    log_handle = None
+    if log_location in ("file", "both") and log_file is not None:
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        log_handle = log_file.open("a")
 
     save_path = getattr(args, "save_path", None)
     if save_path is not None and not isinstance(save_path, Path):
@@ -995,69 +1325,71 @@ def train_model(
 
     augmentor = getattr(dataloader, "augmentor", None)
 
-    for epoch in range(start_epoch, args.epochs):
-        print(f"Epoch {epoch + 1}/{args.epochs}")
-        if augmentor is not None:
-            augmentor.set_epoch(epoch)
+    try:
+        for epoch in range(start_epoch, args.epochs):
+            print(f"Epoch {epoch + 1}/{args.epochs}")
+            if augmentor is not None:
+                augmentor.set_epoch(epoch)
 
-        step = train_one_epoch(
-            model=training_model,
-            dataloader=dataloader,
-            optimizer=optimizer,
-            device=device,
-            grad_clip=args.grad_clip,
-            gradient_accumulation_steps=getattr(args, "gradient_accumulation_steps", 1),
-            start_step=step,
-            log_file=log_file,
-            scheduler=scheduler,
-            epoch=epoch,
-            steps_per_epoch=steps_per_epoch,
-        )
-
-        if val_dataloader is not None:
-            val_loss = validate_one_epoch(
-                model=model,
-                dataloader=val_dataloader,
+            step = train_one_epoch(
+                model=training_model,
+                dataloader=dataloader,
+                optimizer=optimizer,
                 device=device,
+                grad_clip=args.grad_clip,
+                gradient_accumulation_steps=getattr(args, "gradient_accumulation_steps", 1),
+                start_step=step,
+                scheduler=scheduler,
+                epoch=epoch,
+                steps_per_epoch=steps_per_epoch,
+                train_log_mode=train_log_mode,
+                log_location=log_location,
+                log_handle=log_handle,
             )
 
-            val_msg = (
-                f"Epoch {epoch + 1} finished. Validation Output Loss: {val_loss:.4f}"
-            )
-            print(val_msg)
-
-            if log_file:
-                with open(log_file, "a") as f:
-                    f.write(val_msg + "\n")
-
-        if checkpoint_schedule and save_path is not None:
-            epoch_num = epoch + 1
-            if epoch_num in checkpoint_schedule:
-                rng_state = capture_rng_state(device)
-                epoch_save_path = _checkpoint_path_for_epoch(
-                    save_path, epoch_num, args.epochs
-                )
-                maybe_save_model(
-                    model,
-                    dataset,
-                    data_path,
-                    epoch_save_path,
-                    optimizer=optimizer,
-                    global_step=step,
-                    epoch=epoch_num,
-                    rng_state=rng_state,
-                    scheduler=scheduler,
+            if val_dataloader is not None:
+                val_loss = validate_one_epoch(
+                    model=model,
+                    dataloader=val_dataloader,
+                    device=device,
                 )
 
-    rng_state = capture_rng_state(device)
-    maybe_save_model(
-        model,
-        dataset,
-        data_path,
-        save_path,
-        optimizer=optimizer,
-        global_step=step,
-        epoch=args.epochs,
-        rng_state=rng_state,
-        scheduler=scheduler,
-    )
+                val_msg = (
+                    f"Epoch {epoch + 1} finished. Validation Output Loss: {val_loss:.4f}"
+                )
+                _emit_log(val_msg, log_location, log_handle)
+
+            if checkpoint_schedule and save_path is not None:
+                epoch_num = epoch + 1
+                if epoch_num in checkpoint_schedule:
+                    rng_state = capture_rng_state(device)
+                    epoch_save_path = _checkpoint_path_for_epoch(
+                        save_path, epoch_num, args.epochs
+                    )
+                    maybe_save_model(
+                        model,
+                        dataset,
+                        data_path,
+                        epoch_save_path,
+                        optimizer=optimizer,
+                        global_step=step,
+                        epoch=epoch_num,
+                        rng_state=rng_state,
+                        scheduler=scheduler,
+                    )
+
+        rng_state = capture_rng_state(device)
+        maybe_save_model(
+            model,
+            dataset,
+            data_path,
+            save_path,
+            optimizer=optimizer,
+            global_step=step,
+            epoch=args.epochs,
+            rng_state=rng_state,
+            scheduler=scheduler,
+        )
+    finally:
+        if log_handle is not None:
+            log_handle.close()

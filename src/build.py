@@ -97,9 +97,10 @@ def build_model_and_data(
         print("Reusing existing dataset from RAM (skipping 3D pre-computation).")
         dataset = reuse_dataset
     else:
+        splits = ("train", "test") if is_eval else ("train",)
         dataset = ARCExampleDataset(
             json_path=data_path,
-            splits=("train", "test"),
+            splits=splits,
             include_outputs=True,
             max_seq_len=MAX_SEQ_LEN,
             task_whitelist=task_whitelist,
@@ -127,11 +128,14 @@ def build_model_and_data(
     collate_augment_selector = None
     if augmentor is not None:
         collate_augment_selector = augmentor.select_for_example
+    # Keep eval behavior unchanged; training uses true random batching.
+    use_length_bucketing = bool(is_eval or getattr(args, "eval_only", False))
     dataloader = create_dataloader(
         dataset=dataset,
         batch_size=args.batch_size,
         shuffle=not getattr(args, "eval_only", False),
         augment_selector=collate_augment_selector,
+        use_length_bucketing=use_length_bucketing,
     )
     if augmentor is not None:
         dataloader.augmentor = augmentor
@@ -155,6 +159,7 @@ def build_model_and_data(
         d_ff = getattr(args, "d_ff", 512)
         n_layers = getattr(args, "n_layers", 4)
         dropout = getattr(args, "dropout", 0.1)
+        attention_dropout = getattr(args, "attention_dropout", None)
         config = TinyTransformerConfig(
             num_examples=num_examples,
             d_model=d_model,
@@ -162,6 +167,7 @@ def build_model_and_data(
             d_ff=d_ff,
             n_layers=n_layers,
             dropout=dropout,
+            attention_dropout=attention_dropout,
         )
 
     if dataset.num_examples != config.num_examples:
@@ -174,7 +180,14 @@ def build_model_and_data(
 
     if checkpoint:
         state_dict = checkpoint["model_state"]
-        model.load_state_dict(state_dict, strict=False)
+        incompatible = model.load_state_dict(state_dict, strict=False)
+        if "dihedral_embedding.weight" in set(incompatible.missing_keys):
+            checkpoint_path = checkpoint.get("__path__", "<checkpoint>")
+            raise ValueError(
+                "Checkpoint is missing required dihedral embedding weights "
+                f"(dihedral_embedding.weight): {checkpoint_path}. "
+                "This checkpoint predates dihedral embedding support."
+            )
         restore_rng_state(checkpoint.get("rng_state"), device)
 
     # Stash checkpoint for downstream consumers (e.g., so train_model can restore the optimizer).

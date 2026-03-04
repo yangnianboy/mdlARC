@@ -417,6 +417,7 @@ def compute_positions_3d(
 @dataclass
 class SequenceExample:
     tokens: torch.LongTensor
+    sep_index: int
     example_id: int
     task_id: str
     split: str
@@ -426,6 +427,7 @@ class SequenceExample:
     tokens_by_dihedral: Optional[List[torch.LongTensor]] = None
     cached_positions_by_dihedral: Optional[List[torch.LongTensor]] = None
     seq_len_by_dihedral: Optional[List[int]] = None
+    sep_index_by_dihedral: Optional[List[int]] = None
 
 
 class ARCExampleDataset(Dataset):
@@ -500,6 +502,7 @@ class ARCExampleDataset(Dataset):
 
                     tokens_by_dihedral: List[torch.Tensor] = []
                     seq_len_by_dihedral: List[int] = []
+                    sep_index_by_dihedral: List[int] = []
                     skip_example = False
                     for transform_index in range(8):
                         dihedral_input = apply_dihedral_transform(
@@ -527,6 +530,13 @@ class ARCExampleDataset(Dataset):
                         tensor = torch.tensor(tokens, dtype=torch.long)
                         tokens_by_dihedral.append(tensor)
                         seq_len_by_dihedral.append(len(tokens))
+                        try:
+                            sep_index_by_dihedral.append(tokens.index(IO_SEPARATOR_TOKEN_ID))
+                        except ValueError as exc:
+                            raise ValueError(
+                                f"Missing IO separator token for task {task_id} "
+                                f"({split} pair {pair_index}) dihedral {transform_index}."
+                            ) from exc
                     if skip_example:
                         continue
 
@@ -534,6 +544,7 @@ class ARCExampleDataset(Dataset):
                     seq_len = seq_len_by_dihedral[0]
                     example = SequenceExample(
                         tokens=tensor,
+                        sep_index=sep_index_by_dihedral[0],
                         example_id=example_id,
                         task_id=task_id,
                         split=split,
@@ -542,6 +553,7 @@ class ARCExampleDataset(Dataset):
                         seq_len=seq_len,
                         tokens_by_dihedral=tokens_by_dihedral,
                         seq_len_by_dihedral=seq_len_by_dihedral,
+                        sep_index_by_dihedral=sep_index_by_dihedral,
                     )
                     self.indices_by_split.setdefault(split, []).append(
                         len(self.examples)
@@ -661,6 +673,7 @@ def collate_examples(
 ) -> Dict[str, torch.Tensor]:
     if not batch:
         raise ValueError("Empty batch encountered during collation.")
+    del pad_token_id
 
     selected: List[
         Tuple[
@@ -668,17 +681,26 @@ def collate_examples(
             torch.Tensor,
             Optional[torch.Tensor],
             int,
+            int,
             Optional[torch.Tensor],
+            int,
         ]
     ] = []
     for example in batch:
         tokens = example.tokens
+        sep_index = example.sep_index
         cached_positions = getattr(example, "cached_positions", None)
         mapping: Optional[torch.Tensor] = None
         transform_index: Optional[int] = None
+        dihedral_id = 0
         if augment_selector is not None:
             mapping, transform_index = augment_selector(example)
         if transform_index is not None:
+            if transform_index < 0 or transform_index >= 8:
+                raise ValueError(
+                    f"Invalid dihedral index {transform_index} for example {example.task_id}."
+                )
+            dihedral_id = int(transform_index)
             tokens_by_dihedral = getattr(example, "tokens_by_dihedral", None)
             if tokens_by_dihedral:
                 if transform_index < 0 or transform_index >= len(tokens_by_dihedral):
@@ -689,35 +711,60 @@ def collate_examples(
                 cached_by_dihedral = getattr(example, "cached_positions_by_dihedral", None)
                 if cached_by_dihedral:
                     cached_positions = cached_by_dihedral[transform_index]
+                sep_by_dihedral = getattr(example, "sep_index_by_dihedral", None)
+                if sep_by_dihedral:
+                    sep_index = sep_by_dihedral[transform_index]
         seq_len = int(tokens.size(0))
-        selected.append((example, tokens, cached_positions, seq_len, mapping))
+        selected.append(
+            (example, tokens, cached_positions, seq_len, sep_index, mapping, dihedral_id)
+        )
 
     batch_size = len(selected)
-    max_len = max(item[3] for item in selected)
+    seq_lengths = torch.tensor([item[3] for item in selected], dtype=torch.int32)
+    max_len = int(seq_lengths.max().item())
+    total_tokens = int(seq_lengths.sum().item())
 
-    input_ids = torch.full((batch_size, max_len), pad_token_id, dtype=torch.long)
-    attention_mask = torch.zeros((batch_size, max_len), dtype=torch.bool)
+    input_ids = torch.zeros(total_tokens, dtype=torch.long)
     example_ids = torch.zeros(batch_size, dtype=torch.long)
-    positions_3d = torch.zeros((batch_size, max_len, 3), dtype=torch.long)
+    dihedral_ids = torch.zeros(batch_size, dtype=torch.long)
+    sep_indices = torch.zeros(batch_size, dtype=torch.long)
+    positions_3d = torch.zeros((total_tokens, 3), dtype=torch.long)
 
-    for idx, (example, tokens, cached_positions, seq_len, mapping) in enumerate(
-        selected
-    ):
+    cursor = 0
+    for idx, (
+        example,
+        tokens,
+        cached_positions,
+        seq_len,
+        sep_index,
+        mapping,
+        dihedral_id,
+    ) in enumerate(selected):
         if mapping is not None:
             tokens = mapping[tokens]
-        input_ids[idx, :seq_len] = tokens
-        attention_mask[idx, :seq_len] = True
+        next_cursor = cursor + seq_len
+        input_ids[cursor:next_cursor] = tokens
         example_ids[idx] = example.example_id
+        dihedral_ids[idx] = int(dihedral_id)
+        sep_indices[idx] = int(sep_index)
         if cached_positions is None:
             fake_batch = tokens.unsqueeze(0)
             mask = torch.ones_like(fake_batch, dtype=torch.bool)
             cached_positions = compute_positions_3d(fake_batch, mask).squeeze(0)
-        positions_3d[idx, :seq_len] = cached_positions
+        positions_3d[cursor:next_cursor] = cached_positions
+        cursor = next_cursor
+
+    cu_seqlens = torch.zeros(batch_size + 1, dtype=torch.int32)
+    cu_seqlens[1:] = torch.cumsum(seq_lengths, dim=0)
 
     return {
         "input_ids": input_ids,
-        "attention_mask": attention_mask,
+        "cu_seqlens": cu_seqlens,
+        "max_seqlen": max_len,
+        "has_padding": False,
         "example_ids": example_ids,
+        "dihedral_ids": dihedral_ids,
+        "sep_indices": sep_indices,
         "positions_3d": positions_3d,
         "task_ids": [example.task_id for example in batch],
         "splits": [example.split for example in batch],
@@ -733,15 +780,8 @@ def create_dataloader(
     augment_selector: Optional[
         Callable[[SequenceExample], Tuple[Optional[torch.Tensor], Optional[int]]]
     ] = None,
+    use_length_bucketing: bool = True,
 ) -> DataLoader:
-    lengths = getattr(dataset, "sequence_lengths", None)
-    if lengths is None:
-        lengths = [len(dataset[i].tokens) for i in range(len(dataset))]
-
-    bucket_size = max(batch_size * max(1, bucket_size_multiplier), batch_size)
-    batch_sampler = LengthBucketBatchSampler(
-        lengths=lengths, batch_size=batch_size, shuffle=shuffle, bucket_size=bucket_size
-    )
     if augment_selector is not None:
         collate_fn = functools.partial(
             collate_examples,
@@ -749,9 +789,28 @@ def create_dataloader(
         )
     else:
         collate_fn = collate_examples
+
+    if use_length_bucketing:
+        lengths = getattr(dataset, "sequence_lengths", None)
+        if lengths is None:
+            lengths = [len(dataset[i].tokens) for i in range(len(dataset))]
+
+        bucket_size = max(batch_size * max(1, bucket_size_multiplier), batch_size)
+        batch_sampler = LengthBucketBatchSampler(
+            lengths=lengths, batch_size=batch_size, shuffle=shuffle, bucket_size=bucket_size
+        )
+        return DataLoader(
+            dataset,
+            batch_sampler=batch_sampler,
+            num_workers=0,
+            collate_fn=collate_fn,
+        )
+
     return DataLoader(
         dataset,
-        batch_sampler=batch_sampler,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        drop_last=False,
         num_workers=0,
         collate_fn=collate_fn,
     )
