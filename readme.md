@@ -1,11 +1,11 @@
-# 38% on ARC-AGI-1: trained from scratch for just ~$0.60 
-- Takes <2hrs on a 5090
+# 44% on ARC-AGI-1: trained from scratch for just ~$0.67
+- Takes 2hrs on a 5090
 - Uses a standard tranformer
 - 75M parameters
 
 
 ---
-## Self supervised compression on ARC
+<!-- ## Self supervised compression on ARC
 
 Every DL approach on ARC today trains a supervised algorithm (other than compressARC)
 
@@ -15,39 +15,33 @@ A self-supervised compression step will obviously perform better:
 - Test grids have distribution shifts. Compression will push these grids into distribution
 
 Implementation details: [New pareto frontier on ARC-AGI](https://mvakde.github.io/blog/new-pareto-frontier-arc-agi/)  
-For why I chose these specific implementations, read my blog on [Why all ARC solvers fail today](https://mvakde.github.io/blog/why-all-ARC-solvers-fail-today/)
+For why I chose these specific implementations, read my blog on [Why all ARC solvers fail today](https://mvakde.github.io/blog/why-all-ARC-solvers-fail-today/) -->
 
 ## Details
 **UPDATED: (details to follow)**  
-Performance: **38%** on ARC-1 public eval  
-Total compute cost: **~$0.60**  (<2hrs on a 5090 rented on vast.ai)
+Performance: **44%** on ARC-1 public eval  
+Total compute cost: **~$0.67**  (2hrs on a 5090 rented on vast.ai)
 
 **Old:**  
 Performance: 27.5% on ARC-1 public eval  
 Total Compute cost: $1.8 (<3hrs on an A100 rented on Google Colab)
-
+<!-- 
 **Next goal:**  
-50% should be possible with the next research ideas
+50% should be possible with the next research ideas -->
 
 ## Deployment
 1) Rent a 5090, ensure cuda >12.8, ideally >13.0   
-2) Create a virtual environment and install `torch`, `numpy`, `numba`, `matplotlib`  
+2) Create a virtual environment and install `torch`, `numpy`, `numba`, `matplotlib` and `flash-attn`  
 3) Download and build the dataset
 4) (optional) delete raw data, solutions file and dataset scripts to prove no leakage
 5) Run the training and inference script  
 
-This script takes care of (2) and (3):  
+This script takes care of (3)-(5):  
 ```bash
 git clone https://github.com/mvakde/mdlARC.git
 
-# Create virtual env
-cd mdlARC
-python -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-
 # download and build the datasets
-cd dataset_building_scripts
+cd mdlARC/dataset_building_scripts
 python download_and_group.py
 python build_datasets.py arc1 --add-conceptarc --with-filtered
 cd ..
