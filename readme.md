@@ -55,4 +55,15 @@ cd ..
 #run the training + inference script
 python run_script.py high # Choose between 3 modes: low, medium, high
 ```
- Note: To get the best speed, I have disabled logging loss values. Feel free to modify
+ Note: To get the best speed, I have disabled logging loss values. Feel free to add it back
+
+## Citation
+
+```bibtex
+@misc{vakde2025mdlarc,
+  author       = {Mithil Vakde},
+  title        = {mdlARC},
+  year         = {2025},
+  url          = {https://github.com/mvakde/mdlARC},
+}
+```
